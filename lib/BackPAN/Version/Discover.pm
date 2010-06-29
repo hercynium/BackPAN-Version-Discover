@@ -371,6 +371,12 @@ subject to change, if only you *tell me what you want* :)
 
 =head1 SUBROUTINES/METHODS
 
+=head2 new
+
+Creates a new BackPAN::Version::Discover object with the given parameters.
+
+Currently ignores all parameters.
+
 =head2 scan
 
 Scans for installed, loadable modules and tries to determine exactly which

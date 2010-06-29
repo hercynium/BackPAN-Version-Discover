@@ -41,6 +41,30 @@ how to get this object with useful data in it.
 
 =head1 SUBROUTINES/METHODS
 
+=head2 new
+
+Creates a new BackPAN::Version::Discover::Results object with the given parameters.
+
+Note: You should never need to create this object directly!
+
+Parameters:
+
+=over 4
+
+=item * releases_matched
+
+=item * skipped_modules
+
+=item * dists_not_matched
+
+=item * searched_dirs
+
+=item * dist_info
+
+=item * scan_args
+
+=back
+
 =head2 release_paths
 
 returns a list of paths to the release tarballs as can be found on a
