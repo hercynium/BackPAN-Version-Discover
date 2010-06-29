@@ -1,15 +1,27 @@
 BackPAN-Version-Discover
 
-The README is used to introduce the module and provide instructions on
-how to install the module, any machine dependencies it may have (for
-example C compilers and installed libraries) and any other information
-that should be provided before the module is installed.
+This module can be used to discover exactly which versions
+of which cpan distributions you have installed, and give
+you the path to those tarball releases on the backpan.
 
-A README file is required for CPAN modules since CPAN extracts the README
-file from a module distribution so that people browsing the archive
-can use it to get an idea of the module's uses. It is usually a good idea
-to provide version information here so that people can decide whether
-fixes for the module are worth downloading.
+Note: this module is by no means a perfect solution. It makes
+some educated guesses and some assumptions to try and figure
+out exactly what you have installed.
+
+Vendor-packages modules are a particularly odd case, since
+many will be modified, and the maintainers may or may not
+have updated the version numbers. However, most of the time,
+they will at least install these modules to a separate set
+of lib dirs that is designated by the perl binary as being
+the place for them. By default, the scan this module performs
+skips over those modules.
+
+However, on debian-based systems, you can find out what
+packages you have installed that contain perl modules 
+installed under @INC using this shell snippet:
+
+find `perl -e 'print join " ",@INC'` -name '*.pm' 2>/dev/null \
+    | xargs dpkg -S 2>/dev/null | sed 's/:.*$//' | sort -u
 
 
 INSTALLATION
