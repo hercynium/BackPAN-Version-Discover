@@ -1,107 +1,104 @@
-package BackPAN::Version::Discover;
+#!/usr/bin/env perl
 
-our $VERSION = '0.01';
-
-use warnings;
 use strict;
+use warnings;
 
 use Path::Class qw( dir );
-use File::Spec::Functions qw( splitdir );
+use File::Spec::Functions qw( splitpath splitdir );
 use File::Find::Rule qw();
 use Module::Info qw();
+use Data::Dumper qw( Dumper );
 use CPAN qw();
+use BackPAN::Index qw();
 use List::MoreUtils qw( uniq );
+use List::Util qw( reduce );
 use ExtUtils::Installed qw();
 use Module::Extract::VERSION qw();
 use Module::Build::ModuleInfo qw();
+use Text::Trim qw( trim );
 use Config;
+#use Module::Build::Version;
 
-use BackPAN::Version::Discover::Results qw();
+main( @ARGV );
+# TODO add cli opts to add/remove paths to search
 
-# private patched version of BackPAN::Index. Just a hack for
-# now, the next release may have the needed functionality.
-use BackPAN::Version::Discover::_BackPAN::Index qw();
+sub main {
+    my @args = @_;
 
-use Data::Dumper;
+    my %opts; # fill from @args using Getopts::Long
 
-# yeah, it's only "OO" because that's what all the cool kids do.
-sub new {
-    my ($class) = @_;
+    my @search_dirs = determine_search_dirs( %opts );
+    my @pm_files = find_pm_files( @search_dirs );
 
-    return bless {}, $class;
-}
+    # turn pm file paths into module/package names. there may be duplicate
+    # entries, for example from modules installed both as a vendor package
+    # and from CPAN (and therefore in different paths), but we just need
+    # the name for now and will decide later *which* one is important.
+    my @module_names =
+        uniq map { join( '::', splitdir( substr( $_, 0, -3 ) ) ) } @pm_files;
 
-
-# scan the given directories (@INC by default) for modules,
-# analyze them, then use the CPAN and BackPAN indices to
-# guess exactly which version of which distribution each
-# one came from.
-sub scan {
-    my ($self, %args) = @_;
-
-    my @search_dirs = $self->_cleanup_dirs( @{ $args{dirs} || \@INC } );
-
-    my @pm_files = $self->_find_pm_files( @search_dirs );
-
-    my @module_names = $self->_get_module_names( @pm_files );
-
-#print Dumper \@search_dirs, \@pm_files, \@module_names; exit;
-
-    # get a hash of {mod_name => Module::Info obj} and an array with the
+    # get a hash of {mod_name => Module::Info obj} and an array with the 
     # names of modules that module::info couldn't load/parse.
     my ($mi_objs, $non_loadable_mod_names) =
-        $self->_get_module_info_objs( \@module_names, \@search_dirs );
+        load_module_info_objs( \@module_names, \@search_dirs );
 
     # try to match installed modules to their CPAN distributions and get a
-    # bunch of other info on the possible dists and the modules. also, track
+    ## bunch of other info on the possible dists and the modules. also, track
     # modules that will be skipped for various reasons. (eg, no matching dist,
     # couldn't parse out needed info, core/vendor-packaged modules, etc...)
-    my ($dist_info, $skipped_modules) =
-        $self->_get_dist_info( $mi_objs, \@search_dirs );
+    my ($dist_info, $skipped_modules) = 
+        collect_module_dist_info( $mi_objs, \@search_dirs );
 
-    # add non-loadable to skipped 'cause, well, they're skipped, too, right?
-    $skipped_modules->{bad_mod_info} = $non_loadable_mod_names;
+    # use all this data to guess what CPAN releases are installed on this 
+    # machine. If we can find a matching dist name and version on the backpan
+    # we'll assume there's a match.
+    #
+    # $bp_releases is a hash of { dist name => [ dist file paths...] }
+    # $no_release_matched is an array of dist names where no matches were found
+    # $dist_info will have additional bits of data added, in case we really
+    # need to do more processing for some reason :)
+    my ($bp_releases, $no_release_matched) = find_backpan_releases( $dist_info );
 
-    # finally, use all this data to try to guess which releases we actualy 
-    # have installed. Some dists will have no matching release. $dist_info
-    # will also have various new bits of info added, if we need it later.
-    my ($bp_releases, $no_release_matched) =
-        $self->_guess_backpan_releases( $dist_info );
+    print Dumper $bp_releases, {
+        no_match => $no_release_matched,
+        skipped  => $skipped_modules,
+        bad_names => $non_loadable_mod_names,
+    };
+    my $total_releases = do {
+        no warnings 'once';
+        reduce { $a + $b }
+            map { scalar @$_ } values %$bp_releases;
+    };
+    print "TOTAL RELEASES MATCHED: $total_releases\n";
 
-    # the results object will have facilities to get the intresting
-    # info from the results, plus info needed to re-run the same scan
-    # any anything else people may ask for :)
-    return BackPAN::Version::Discover::Results->new(
-        releases_matched  => $bp_releases,
-        skipped_modules   => $skipped_modules,
-        dists_not_matched => $no_release_matched,
-        searched_dirs     => \@search_dirs,
-        dist_info         => $dist_info,
-        scan_args         => \%args,
-    );
+    return 1;
 }
+
+
+
+
 
 
 # we want to only search dirs that will be useful... therefore, we need to
 #  a. weed out obvious dead-ends like duplicate and non-existent paths.
 #  b. resolve all paths and make them absolute, so the output data is sane.
-sub _cleanup_dirs {
-    my ($self, @dirs) = @_;
+sub determine_search_dirs {
+    my %opts = @_;
 
     my @search_dirs =
         grep { -e } uniq
             map { dir($_)->absolute } #->resolve }
-                @dirs;
+                @INC;
 
     # no need to return Path::Class: objects
     return map { "$_" } @search_dirs;
 }
 
 
-# find all the pm files, relative to each directory
+# find all the pm files, relative to each directory 
 # (for easier translation into module/package names)
-sub _find_pm_files {
-    my ($self, @search_dirs) = @_;
+sub find_pm_files {
+    my @search_dirs = @_;
 
     my @pm_files;
     for my $dir ( @search_dirs ) {
@@ -112,34 +109,15 @@ sub _find_pm_files {
             ->name( '*.pm' )
             ->in( $dir );
     }
-
     return @pm_files;
 }
 
 
-# turn pm file paths into module/package names. there may be duplicate
-# entries, for example from modules installed both as a vendor package
-# and from CPAN (and therefore in different paths), but we just need
-# the name for now and will decide later *which* one is important,
-# specifically, the one that perl would load when used in a script.
-sub _get_module_names {
-    my ($self, @pm_files) = @_;
-
-    my @module_names =
-        uniq
-        map { join( '::', splitdir( substr( $_, 0, -3 ) ) ) }
-        @pm_files;
-
-    return @module_names;
-}
-
-
-# construct a Module::Info object for each module but keep
+# next, construct a Module::Info object for each module but keep
 # track of invalid names and mods M::I couldn't load (we won't
 # do anything with them, but it may be useful to know)
-sub _get_module_info_objs {
-    my ($self, $module_names, $search_dirs) = @_;
-
+sub load_module_info_objs {
+    my ($module_names, $search_dirs) = @_;
     my @bad_modules;
     my %module_data =
         map  { @$_ }
@@ -154,13 +132,8 @@ sub _get_module_info_objs {
     return \%module_data, \@bad_modules;
 }
 
-
-# extract/guess a bunch of info from each module, then try to match
-# each module to a cpan distribution. also, exclude modules from 
-# analysis based on various criteria.
-# NOTE: this could probably be split into two or more smaller subs.
-sub _get_dist_info {
-    my ($self, $module_info_objs, $search_dirs) = @_;
+sub collect_module_dist_info {
+    my ($module_info_objs, $search_dirs) = @_;
 
     my %dist_info;       # info on dists that our modules match
     my %skipped_modules = (  # info on modules we skip
@@ -193,13 +166,13 @@ sub _get_dist_info {
             next MODULE;
         }
 
-        # skip vendor mods
-        for my $dir ( @Config{ qw( installvendorarch installvendorlib ) } ) {
-            if ( dir($dir)->subsumes($mod_file) ) {
-                push @{ $skipped_modules{is_vendor} }, $mod_name;
-                next MODULE;
-            }
-        }
+        ## skip vendor mods
+        #for my $dir ( @Config{qw(installvendorarch installvendorlib)} ) {
+        #    if ( dir($dir)->subsumes($mod_file) ) {
+        #        push @{ $skipped_modules{is_vendor} }, $mod_name;
+        #        next MODULE;
+        #    }
+        #}
 
         # look for a version in the module file
         $mod_data->{mi_mod_inst_ver} = $mi_obj->version;
@@ -209,15 +182,14 @@ sub _get_dist_info {
         $mod_data->{mev_mod_inst_ver} =
             Module::Extract::VERSION->parse_version_safely( $mod_file );
 
-        # this is (kinda) how Module::Build gets the version... 
-        # but messier and not really.
+        # this is (kinda) how Module::Build gets the version... but messier and not really.
         if ( eval { "$mod_data->{mi_mod_inst_ver}" } and my $pm_info =
             eval { Module::Build::ModuleInfo->new_from_file( $mi_obj->file ) }
         ) {
             if (my $ver = $pm_info->version() ) {
-                $mod_data->{mb_mod_inst_ver} =
-                    ! UNIVERSAL::can($ver, 'is_qv') ?
-                        $ver : $ver->is_qv ?
+                $mod_data->{mb_mod_inst_ver} = 
+                    ! UNIVERSAL::can($ver, 'is_qv') ? 
+                        $ver : $ver->is_qv ? 
                             $ver->normal : $ver->stringify;
             }
         }
@@ -270,8 +242,8 @@ sub _get_dist_info {
 # use the info we have to:
 #  a. guess which version of the dist is installed
 #  b. look for a release (dist-name + version) in the backpan index.
-sub _guess_backpan_releases {
-    my ($self, $dist_info) = @_;
+sub find_backpan_releases {
+    my ($dist_info) = @_;
 
     # releases we were able to match are hits
     # dists where we couldn't find a match are misses
@@ -287,22 +259,18 @@ sub _guess_backpan_releases {
 
             my $release_data = $dist_info->{$dist_name}{$latest_dist_ver};
 
-            # THEORY: if we look at all the latest CPAN::Module objects
-            # in this release (supposedly the latest from CPAN) and at
-            # least one module has the same version as the dist, then
+            # THEORY: if we look at all the latest CPAN::Module objects 
+            # in this release (supposedly the latest from CPAN) and at 
+            # least one module has the same version as the dist, then 
             # we can assume that the "installed version" of that same
-            # module is the version of the dist we want to find as a
+            # module is the version of the dist we want to find as a 
             # release on the backpan.
 
-            my @version_types = qw(
-                mb_mod_inst_ver mev_mod_inst_ver
-                cpan_mod_inst_ver mi_mod_inst_ver
-            );
-
+            my @version_types = qw( mb_mod_inst_ver mev_mod_inst_ver cpan_mod_inst_ver mi_mod_inst_ver );
             my @version_guesses;
             for my $mod_data ( @{ $release_data->{module_data} } ) {
                 next unless $latest_dist_ver eq $mod_data->{cpan_mod_latest_ver};
-                push @version_guesses, grep { $_ and $_ ne 'undef' }
+                push @version_guesses, grep { $_ and $_ ne 'undef' } 
                     @{$mod_data}{@version_types};
             }
             @version_guesses = reverse uniq sort @version_guesses;
@@ -310,12 +278,16 @@ sub _guess_backpan_releases {
             if ( ! @version_guesses ) {
                 # if we couldn't find a correlation between the dist version
                 # and any of the module versions, move on.
+                #printf "%-30s %-15s [no matching module versions]\n", $dist_name, $latest_dist_ver;
                 push @bp_misses, $dist_name;
                 next DIST;
             }
 
+            #printf "%-30s %-15s [%s] ", $dist_name, $latest_dist_ver, join ' ', @version_guesses;
+
             # maybe we have to latest CPAN version?
             if( grep { $_ eq $latest_dist_ver } @version_guesses ) {
+                #print "[LATEST]\n";
                 next DIST;
             }
 
@@ -323,124 +295,14 @@ sub _guess_backpan_releases {
                 if( my $bp_release = $bp->release( $dist_name, $ver_guess ) ) {
                     my $rel_path = $bp_release->path;
                     push @{ $bp_hits{ $dist_name } ||= [] }, "$rel_path";
+                    #print "[FOUND: " . join( ' ', $rel_path ). "]\n";
                     next DIST;
                 }
             }
-
+            #print "[NOT FOUND]\n";
             push @bp_misses, $dist_name;
         }
     }
     return \%bp_hits, \@bp_misses;
 }
-
-
-###
-1;
-
-__END__
-
-=head1 NAME
-
-BackPAN::Version::Discover - Figure out exactly which dist versions you have installed
-
-=head1 VERSION
-
-Version 0.01
-
-=cut
-
-=head1 SYNOPSIS
-
-Please note: this module's interface is HIGHLY ALPHA, mainly because I want
-input from users on how they think it should work. Therefore, this is all
-subject to change, if only you *tell me what you want* :)
-
-    use BackPAN::Version::Discover;
-    
-    my $bvd = BackPAN::Version::Discover->new();
-    
-    # exclude relative dirs and anything under $HOME
-    my @dirs = grep { ! /^$ENV{HOME}|^[^\/]/ } @INC;
-    
-    # this may take some time and use lots of ram and/or CPU
-    my $results = $bvd->scan( dirs => \@dirs );
-    
-    # please let me know if the separate results object is good or bad.
-    my @releases = $results->release_paths();
-    my 
-
-=head1 SUBROUTINES/METHODS
-
-=head2 scan
-
-Scans for installed, loadable modules and tries to determine exactly which
-CPAN/BackPAN distribution release each may have come from. If the C<dirs>
-option is specified, the scan will be restricted to the given array of
-directories. Otherwise, it will default to searching all directories
-currently specified in @INC.
-
-Options:
-
-=over 4
-
-=item dirs
-
-An arrayref containing the directories to scan.
-
-=back
-
-=head1 AUTHOR
-
-Stephen R. Scaffidi, C<< <sscaffidi at cpan.org> >>
-
-=head1 BUGS
-
-Please report any bugs or feature requests to
-C<bug-backpan-version-discover at rt.cpan.org>, or through the web interface
-at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=BackPAN-Version-Discover>.
-I will be notified, and then you'll automatically be notified of progress on
-your bug as I make changes.
-
-=head1 SUPPORT
-
-You can find documentation for this module with the perldoc command.
-
-    perldoc BackPAN::Version::Discover
-
-You can also look for information at:
-
-=over 4
-
-=item * RT: CPAN's request tracker
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=BackPAN-Version-Discover>
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/BackPAN-Version-Discover>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/BackPAN-Version-Discover>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/BackPAN-Version-Discover/>
-
-=back
-
-=head1 ACKNOWLEDGEMENTS
-
-
-=head1 LICENSE AND COPYRIGHT
-
-Copyright 2010 Stephen R. Scaffidi.
-
-This program is free software; you can redistribute it and/or modify it
-under the terms of either: the GNU General Public License as published
-by the Free Software Foundation; or the Artistic License.
-
-See http://dev.perl.org/licenses/ for more information.
-
-=cut
 
