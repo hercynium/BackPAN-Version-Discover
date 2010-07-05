@@ -3,6 +3,7 @@ bin/original_script.pl
 bin/README
 Build.PL
 Changes
+dist.ini
 ignore.txt
 lib/BackPAN/Version/Discover.pm
 lib/BackPAN/Version/Discover/_BackPAN/Index.pm
