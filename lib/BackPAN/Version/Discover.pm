@@ -195,6 +195,7 @@ sub _get_dist_info {
 
         # skip vendor mods
         for my $dir ( @Config{ qw( installvendorarch installvendorlib ) } ) {
+            next unless $dir;
             if ( dir($dir)->subsumes($mod_file) ) {
                 push @{ $skipped_modules{is_vendor} }, $mod_name;
                 next MODULE;
